@@ -18,6 +18,14 @@ from PIL import Image
 
 slim = tf.contrib.slim
 
+total_loss = None
+probabilities = None
+grad_accumulator_ops = None
+apply_gradient_op = None
+input_image = None
+input_label = None
+negClick = False
+
 
 def osvos_arg_scope(weight_decay=0.0002):
     """Defines the OSVOS arg scope.
@@ -188,8 +196,16 @@ def preprocess_labels(label):
     """
     if type(label) is not np.ndarray:
         label = np.array(Image.open(label).split()[0], dtype=np.uint8)
+        
+    global negClick
+    if 50 in label:
+        negClick = True
+    #    label = np.select([label==50], [0])
     max_mask = np.max(label) * 0.5
     label = np.greater(label, max_mask)
+    
+
+    
     label = np.expand_dims(np.expand_dims(label, axis=0), axis=3)
     # label = tf.cast(np.array(label), tf.float32)
     # max_mask = tf.multiply(tf.reduce_max(label), 0.5)
@@ -217,7 +233,7 @@ def load_vgg_imagenet(ckpt_path):
     return init_fn
 
 
-def class_balanced_cross_entropy_loss(output, label):
+def class_balanced_cross_entropy_loss(output, label, negClk=False):
     """Define the class balanced cross entropy loss to train the network
     Args:
     output: Output of the network
@@ -226,8 +242,53 @@ def class_balanced_cross_entropy_loss(output, label):
     Tensor that evaluates the loss
     """
 
+    """
+    posLabels = tf.cast(tf.equal(label, 1), tf.float32)
+    negLabels = tf.cast(tf.equal(label, 0), tf.float32)
+    
+    num_labels_pos = tf.reduce_sum(posLabels)
+    num_labels_neg = tf.reduce_sum(negLabels)
+    num_total = num_labels_pos + num_labels_neg
+    """
+    
+        
     labels = tf.cast(tf.greater(label, 0.5), tf.float32)
 
+    #num_labels_pos = tf.reduce_sum(labels)
+    #num_labels_neg = tf.reduce_sum(1-labels)
+    #num_total = num_labels_pos + num_labels_neg
+    
+    global negClick
+    if negClick:
+        pos_weight = (1.0/50.0)
+        neg_weight = 1.0-pos_weight
+        negClick = False
+    else:
+        pos_weight = (1.0/400.0)
+        neg_weight = 1.0-pos_weight
+    #num_labels_neg = num_total - num_labels_pos
+    
+    output_gt_zero = tf.cast(tf.greater_equal(output, 0), tf.float32)
+    loss_val = tf.multiply(output, (labels - output_gt_zero)) - tf.log(
+        1 + tf.exp(output - 2 * tf.multiply(output, output_gt_zero)))
+
+    loss_pos = tf.reduce_sum(-tf.multiply(labels, loss_val))
+    loss_neg = tf.reduce_sum(-tf.multiply(1.0-labels, loss_val))    
+    
+
+    
+    #final_loss = num_labels_neg / num_total * loss_pos + num_labels_pos / num_total * loss_neg
+    final_loss = neg_weight * loss_pos + pos_weight * loss_neg
+    
+    #loss_pos = tf.reduce_sum(tf.multiply(posLabels, (posLabels-output_gt_zero)))
+    #loss_neg= tf.reduce_sum(tf.multiply(negLabels, (output_gt_zero-negLabels)))
+    #final_loss = loss_pos + loss_neg
+    
+    """
+    #output = tf.Print(output, [output])
+    labels = tf.cast(tf.greater(label, 0.5), tf.float32)
+    
+        
     num_labels_pos = tf.reduce_sum(labels)
     num_labels_neg = tf.reduce_sum(1.0 - labels)
     num_total = num_labels_pos + num_labels_neg
@@ -238,9 +299,13 @@ def class_balanced_cross_entropy_loss(output, label):
 
     loss_pos = tf.reduce_sum(-tf.multiply(labels, loss_val))
     loss_neg = tf.reduce_sum(-tf.multiply(1.0 - labels, loss_val))
-
+    #loss_pos = tf.Print(loss_pos, [loss_pos])
+    #loss_neg = tf.Print(loss_neg, [loss_neg])
+    
+    
+    
     final_loss = num_labels_neg / num_total * loss_pos + num_labels_pos / num_total * loss_neg
-
+    """
     return final_loss
 
 
@@ -395,9 +460,8 @@ def parameter_lr():
     return vars_corresp
 
 
-def _train(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_training_iters, save_step, display_step,
-           global_step, iter_mean_grad=1, batch_size=1, momentum=0.9, resume_training=False, config=None, finetune=1,
-           test_image_path=None, ckpt_name="osvos"):
+
+def train_init(initial_ckpt, supervison, learning_rate, logs_path, global_step, config=None, iter_mean_grad=1, batch_size=1, momentum=0.9,ckpt_name="osvos"):
     """Train OSVOS
     Args:
     dataset: Reference to a Dataset object instance
@@ -418,7 +482,6 @@ def _train(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_trai
     test_image_path: If image path provided, every save_step the result of the network with this image is stored
     Returns:
     """
-    model_name = os.path.join(logs_path, ckpt_name+".ckpt")
     if config is None:
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
@@ -427,6 +490,13 @@ def _train(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_trai
 
     tf.logging.set_verbosity(tf.logging.INFO)
 
+    global input_image
+    global input_label
+    global total_loss 
+    global probabilities
+    global grad_accumulator_ops 
+    global apply_gradient_op
+    
     # Prepare the input data
     input_image = tf.placeholder(tf.float32, [batch_size, None, None, 3])
     input_label = tf.placeholder(tf.float32, [batch_size, None, None, 1])
@@ -435,24 +505,24 @@ def _train(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_trai
     with slim.arg_scope(osvos_arg_scope()):
         net, end_points = osvos(input_image)
 
-    # Initialize weights from pre-trained model
-    if finetune == 0:
-        init_weights = load_vgg_imagenet(initial_ckpt)
+#     # Initialize weights from pre-trained model
+#     if finetune == 0:
+#         init_weights = load_vgg_imagenet(initial_ckpt)
 
     # Define loss
     with tf.name_scope('losses'):
         if supervison == 1 or supervison == 2:
             dsn_2_loss = class_balanced_cross_entropy_loss(end_points['osvos/score-dsn_2-cr'], input_label)
-            tf.summary.scalar('dsn_2_loss', dsn_2_loss)
+            #tf.summary.scalar('dsn_2_loss', dsn_2_loss)
             dsn_3_loss = class_balanced_cross_entropy_loss(end_points['osvos/score-dsn_3-cr'], input_label)
-            tf.summary.scalar('dsn_3_loss', dsn_3_loss)
+            #tf.summary.scalar('dsn_3_loss', dsn_3_loss)
             dsn_4_loss = class_balanced_cross_entropy_loss(end_points['osvos/score-dsn_4-cr'], input_label)
-            tf.summary.scalar('dsn_4_loss', dsn_4_loss)
+            #tf.summary.scalar('dsn_4_loss', dsn_4_loss)
             dsn_5_loss = class_balanced_cross_entropy_loss(end_points['osvos/score-dsn_5-cr'], input_label)
-            tf.summary.scalar('dsn_5_loss', dsn_5_loss)
+            #tf.summary.scalar('dsn_5_loss', dsn_5_loss)
 
         main_loss = class_balanced_cross_entropy_loss(net, input_label)
-        tf.summary.scalar('main_loss', main_loss)
+        #tf.summary.scalar('main_loss', main_loss)
 
         if supervison == 1:
             output_loss = dsn_2_loss + dsn_3_loss + dsn_4_loss + dsn_5_loss + main_loss
@@ -464,11 +534,11 @@ def _train(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_trai
             sys.exit('Incorrect supervision id, select 1 for supervision of the side outputs, 2 for weak supervision '
                      'of the side outputs and 3 for no supervision of the side outputs')
         total_loss = output_loss + tf.add_n(tf.losses.get_regularization_losses())
-        tf.summary.scalar('total_loss', total_loss)
+        #tf.summary.scalar('total_loss', total_loss)
 
     # Define optimization method
     with tf.name_scope('optimization'):
-        tf.summary.scalar('learning_rate', learning_rate)
+        #tf.summary.scalar('learning_rate', learning_rate)
         optimizer = tf.train.MomentumOptimizer(learning_rate, momentum)
         grads_and_vars = optimizer.compute_gradients(total_loss)
         with tf.name_scope('grad_accumulator'):
@@ -491,92 +561,76 @@ def _train(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_trai
                     (grad_acc.take_grad(iter_mean_grad), grads_and_vars[var_ind][1]))
             apply_gradient_op = optimizer.apply_gradients(mean_grads_and_vars, global_step=global_step)
     # Log training info
-    merged_summary_op = tf.summary.merge_all()
+    #merged_summary_op = tf.summary.merge_all()
 
     # Log evolution of test image
-    if test_image_path is not None:
-        probabilities = tf.nn.sigmoid(net)
-        img_summary = tf.summary.image("Output probabilities", probabilities, max_outputs=1)
+    probabilities = tf.nn.sigmoid(net)
+        #img_summary = tf.summary.image("Output probabilities", probabilities, max_outputs=1)
     # Initialize variables
     init = tf.global_variables_initializer()
+        
+    
+    sess = tf.Session(config=config)
+    print 'Init variable'
+    sess.run(init)
 
-    # Create objects to record timing and memory of the graph execution
-    # run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE) # Option in the session options=run_options
-    # run_metadata = tf.RunMetadata() # Option in the session run_metadata=run_metadata
-    # summary_writer.add_run_metadata(run_metadata, 'step%d' % i)
-    with tf.Session(config=config) as sess:
-        print 'Init variable'
-        sess.run(init)
+    # op to write logs to Tensorboard
+    #summary_writer = tf.summary.FileWriter(logs_path, graph=tf.get_default_graph())
 
-        # op to write logs to Tensorboard
-        summary_writer = tf.summary.FileWriter(logs_path, graph=tf.get_default_graph())
+    # Create saver to manage checkpoints
+    saver = tf.train.Saver(max_to_keep=None)
 
-        # Create saver to manage checkpoints
-        saver = tf.train.Saver(max_to_keep=None)
+    last_ckpt_path = tf.train.latest_checkpoint(logs_path)
 
-        last_ckpt_path = tf.train.latest_checkpoint(logs_path)
-        if last_ckpt_path is not None and resume_training:
-            # Load last checkpoint
-            print('Initializing from previous checkpoint...')
-            saver.restore(sess, last_ckpt_path)
-            step = global_step.eval() + 1
-        else:
-            # Load pre-trained model
-            if finetune == 0:
-                print('Initializing from pre-trained imagenet model...')
-                init_weights(sess)
-            else:
-                print('Initializing from specified pre-trained model...')
-                # init_weights(sess)
-                var_list = []
-                for var in tf.global_variables():
-                    var_type = var.name.split('/')[-1]
-                    if 'weights' in var_type or 'bias' in var_type:
-                        var_list.append(var)
-                saver_res = tf.train.Saver(var_list=var_list)
-                saver_res.restore(sess, initial_ckpt)
-            step = 1
-        sess.run(interp_surgery(tf.global_variables()))
-        print('Weights initialized')
+    # Load last checkpoint
+    if last_ckpt_path is not None:
+        print('Initializing from previous checkpoint...')
+        saver.restore(sess, last_ckpt_path)
+    else:
+        print('Initializing from specified pre-trained parent model...')
+        # init_weights(sess)
+        var_list = []
+        for var in tf.global_variables():
+            var_type = var.name.split('/')[-1]
+            if 'weights' in var_type or 'bias' in var_type:
+                var_list.append(var)
+        saver_res = tf.train.Saver(var_list=var_list)
+        saver_res.restore(sess, initial_ckpt)
 
-        print 'Start training'
-        while step < max_training_iters + 1:
-            # Average the gradient
-            for _ in range(0, iter_mean_grad):
-                batch_image, batch_label = dataset.next_batch(batch_size, 'train')
-                image = preprocess_img(batch_image[0])
-                label = preprocess_labels(batch_label[0])
-                run_res = sess.run([total_loss, merged_summary_op] + grad_accumulator_ops,
-                                   feed_dict={input_image: image, input_label: label})
-                batch_loss = run_res[0]
-                summary = run_res[1]
+    sess.run(interp_surgery(tf.global_variables()))
+    print('Weights initialized')
+    
+    return sess 
 
-            # Apply the gradients
-            sess.run(apply_gradient_op)  # Momentum updates here its statistics
+        
+    
+def train_run(sess, train_image, train_label):            
+    print 'Start training'
 
-            # Save summary reports
-            summary_writer.add_summary(summary, step)
+    image = preprocess_img(train_image)
+    label = preprocess_labels(train_label)
+    run_res = sess.run([total_loss] + grad_accumulator_ops,
+                       feed_dict={input_image: image, input_label: label})
+    batch_loss = run_res[0]
 
-            # Display training status
-            if step % display_step == 0:
-                print >> sys.stderr, "{} Iter {}: Training Loss = {:.4f}".format(datetime.now(), step, batch_loss)
+    # Apply the gradients
+    sess.run(apply_gradient_op)  # Momentum updates here its statistics
 
-            # Save a checkpoint
-            if step % save_step == 0:
-                if test_image_path is not None:
-                    curr_output = sess.run(img_summary, feed_dict={input_image: preprocess_img(test_image_path)})
-                    summary_writer.add_summary(curr_output, step)
-                save_path = saver.save(sess, model_name, global_step=global_step)
-                print "Model saved in file: %s" % save_path
+    print >> sys.stderr, "Training Loss = {:.4f}".format(batch_loss)
+    print('Finished training.')
+    return sess 
+                
 
-            step += 1
 
-        if (step - 1) % save_step != 0:
-            save_path = saver.save(sess, model_name, global_step=global_step)
-            print "Model saved in file: %s" % save_path
-
-        print('Finished training.')
-
+def test_run(sess, img):
+    image = preprocess_img(img)
+    res = sess.run(probabilities, feed_dict={input_image: image})
+    res_np = res.astype(np.float32)[0, :, :, 0] > 162.0/255.0
+    #scipy.misc.imsave(os.path.join(result_path, curr_frame), res_np.astype(np.float32))
+    #print 'Saving ' + os.path.join(result_path, curr_frame)
+    return res_np
+            
+            
 
 def train_parent(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_training_iters, save_step,
                  display_step, global_step, iter_mean_grad=1, batch_size=1, momentum=0.9, resume_training=False,
@@ -601,9 +655,10 @@ def train_finetune(dataset, initial_ckpt, supervison, learning_rate, logs_path, 
     Returns:
     """
     finetune = 1
-    _train(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_training_iters, save_step, display_step,
+    train_run(dataset, initial_ckpt, supervison, learning_rate, logs_path, max_training_iters, save_step, display_step,
            global_step, iter_mean_grad, batch_size, momentum, resume_training, config, finetune, test_image_path,
            ckpt_name)
+     
 
 
 def test(dataset, checkpoint_file, result_path, config=None):
