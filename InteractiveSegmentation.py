@@ -16,7 +16,7 @@ import evalsegm as es
 
 gpu_id = 0
 
-seq_name = 'dancing' #'blackswan' #'drone' #"PersonFinder_large" #"CarChaser_large" #"car-turn" "bmx-trees" "man-bike"
+seq_name = "man-bike" #'dancing' #'blackswan' #'drone' #"PersonFinder_large" #"CarChaser_large" #"car-turn" "bmx-trees" 
 file_name = seq_name+"singledotr10-20ite"
 
 #test_folder = os.path.join('evalDatasets', seq_name, 'test')
